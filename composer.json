@@ -1,0 +1,7 @@
+{
+    "require": {
+        "sonata-project/google-authenticator": "^2.3",
+        "endroid/qr-code": "^6.0",
+        "mike42/escpos-php": "^3.0"
+    }
+}

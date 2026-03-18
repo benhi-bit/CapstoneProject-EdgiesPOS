@@ -1,0 +1,1094 @@
+================================================================================
+EDGIES POS SYSTEM v1.2 - MAIN BUTTONS BACKEND CODE (Capstone Documentation)
+================================================================================
+
+--------------------------------------------------------------------------------
+Login Button:
+Code:
+--------------------------------------------------------------------------------
+
+if ($_SERVER["REQUEST_METHOD"] == "POST") {
+    $user = $_POST['username'];
+    $pass = $_POST['password'];
+    $ip = $_SERVER['REMOTE_ADDR'];
+
+    $stmt = $conn->prepare("SELECT UserID, Username, Password, Role, FullName, two_factor_secret FROM loginaccount WHERE BINARY Username = ?");
+    $stmt->bind_param("s", $user);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    if ($result->num_rows === 0) {
+        $loginError = true;
+        $userNotFound = true;
+    } else {
+        $row = $result->fetch_assoc();
+        // ... lockout checks and attempt counting (see index.php) ...
+        if (!$isCurrentlyLocked) {
+            if (password_verify($pass, $row['Password'])) {
+                $clearAttempts = $conn->prepare("DELETE FROM login_attempts WHERE BINARY username = ?");
+                $clearAttempts->bind_param("s", $user);
+                $clearAttempts->execute();
+                $clearAttempts->close();
+
+                $has2FA = !empty($row['two_factor_secret']);
+                $_SESSION['pending_user_id'] = $row['UserID'];
+                $_SESSION['pending_username'] = $row['Username'];
+                $_SESSION['pending_role'] = $row['Role'];
+
+                if ($has2FA) {
+                    header("Location: authentication/verify_2fa.php");
+                    exit();
+                } else {
+                    header("Location: authentication/setup_2fa.php");
+                    exit();
+                }
+            } else {
+                $logAttempt = $conn->prepare("INSERT INTO login_attempts (username, attempt_time, ip_address) VALUES (?, NOW(), ?)");
+                $logAttempt->bind_param("ss", $user, $ip);
+                $logAttempt->execute();
+                $logAttempt->close();
+            }
+        }
+    }
+}
+File: index.php
+
+
+--------------------------------------------------------------------------------
+Add New User Button:
+Code:
+--------------------------------------------------------------------------------
+
+<?php
+session_start();
+if (!isset($_SESSION['Username']) || $_SESSION['Role'] !== 'Admin') {
+    echo json_encode(['success' => false, 'message' => 'Unauthorized access']);
+    exit();
+}
+
+require_once __DIR__ . '/../config/connection.php';
+require_once __DIR__ . '/../lib/log_helper.php';
+
+function isAjaxRequest() {
+    if (!empty($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest') return true;
+    if (!empty($_SERVER['HTTP_ACCEPT']) && strpos($_SERVER['HTTP_ACCEPT'], 'application/json') !== false) return true;
+    return false;
+}
+$isAjax = isAjaxRequest();
+
+$currentSessionUsername = $_SESSION['Username'] ?? '';
+$userQuery = $conn->prepare("SELECT FullName, Username FROM loginaccount WHERE BINARY Username = ?");
+$userQuery->bind_param("s", $currentSessionUsername);
+$userQuery->execute();
+$userData = $userQuery->get_result()->fetch_assoc();
+$userQuery->close();
+
+if (!empty($userData) && !empty($userData['FullName']) && trim($userData['FullName']) !== '') {
+    $userFullName = trim($userData['FullName']);
+} elseif (!empty($userData) && !empty($userData['Username'])) {
+    $userFullName = $userData['Username'];
+} else {
+    $userFullName = 'Administrator';
+}
+
+if ($isAjax) header('Content-Type: application/json');
+
+if ($_SERVER["REQUEST_METHOD"] == "POST") {
+    $role = isset($_POST['role']) ? $_POST['role'] : 'Cashier';
+    if ($role !== 'Admin' && $role !== 'Cashier') $role = 'Cashier';
+
+    $fullName = $_POST['fullName'];
+    $username = $_POST['username'];
+    $email = isset($_POST['email']) ? $_POST['email'] : '';
+    $password = isset($_POST['password']) ? $_POST['password'] : '';
+    $confirmPassword = isset($_POST['confirmPassword']) ? $_POST['confirmPassword'] : '';
+    $recoveryQuestion = isset($_POST['recoveryQuestion']) ? $_POST['recoveryQuestion'] : '';
+    $recoveryAnswer = isset($_POST['recoveryAnswer']) ? $_POST['recoveryAnswer'] : '';
+    $dateCreated = date('Y-m-d H:i:s');
+
+    if (empty($password)) {
+        $msg = 'Password is required.';
+        if ($isAjax) echo json_encode(['success' => false, 'message' => $msg]);
+        else header('Location: user_management.php?error=' . urlencode($msg));
+        exit();
+    }
+
+    $passwordPattern = '/^(?=.*[A-Z])(?=.*\d)[A-Za-z\d@$!%*?&]{6,}$/';
+    if (!preg_match($passwordPattern, $password)) {
+        $msg = 'Password must be at least 6 characters long and contain at least one uppercase letter and one number.';
+        if ($isAjax) echo json_encode(['success' => false, 'message' => $msg]);
+        else header('Location: user_management.php?error=' . urlencode($msg));
+        exit();
+    }
+
+    if ($password !== $confirmPassword) {
+        $msg = 'Passwords do not match. Please re-enter.';
+        if ($isAjax) echo json_encode(['success' => false, 'message' => $msg]);
+        else header('Location: user_management.php?error=' . urlencode($msg));
+        exit();
+    }
+
+    $password = password_hash($password, PASSWORD_DEFAULT);
+
+    $checkStmt = $conn->prepare("SELECT Username, FullName, Email FROM loginaccount WHERE Username = ? OR FullName = ? OR (Email = ? AND Email != '')");
+    $checkStmt->bind_param("sss", $username, $fullName, $email);
+    $checkStmt->execute();
+    $result = $checkStmt->get_result();
+
+    if ($result->num_rows > 0) {
+        $row = $result->fetch_assoc();
+        if ($row['Username'] === $username) $msg = 'Username already exists. Please choose a different username.';
+        else if ($row['FullName'] === $fullName) $msg = 'Full name already exists. Please use a different full name.';
+        else if ($row['Email'] === $email && $email !== '') $msg = 'Email already exists. Please use a different email address.';
+        if ($isAjax) echo json_encode(['success' => false, 'message' => $msg]);
+        else header('Location: user_management.php?error=' . urlencode($msg));
+        exit();
+    }
+    $checkStmt->close();
+
+    $stmt = $conn->prepare("INSERT INTO loginaccount (Role, FullName, Username, Email, Password, RecoveryQuestion, RecoveryAnswer, Date_Created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+    $stmt->bind_param("ssssssss", $role, $fullName, $username, $email, $password, $recoveryQuestion, $recoveryAnswer, $dateCreated);
+
+    if ($stmt->execute()) {
+        addSystemLog($conn, "User Created", "New user account created: " . $username, $userFullName);
+        $msg = 'User added successfully!';
+        if ($isAjax) echo json_encode(['success' => true, 'message' => $msg]);
+        else header('Location: user_management.php?success=' . urlencode($msg));
+    } else {
+        $msg = 'Error adding user: ' . $stmt->error;
+        if ($isAjax) echo json_encode(['success' => false, 'message' => $msg]);
+        else header('Location: user_management.php?error=' . urlencode($msg));
+    }
+    $stmt->close();
+} else {
+    $msg = 'Invalid request method';
+    if ($isAjax) echo json_encode(['success' => false, 'message' => $msg]);
+    else header('Location: user_management.php?error=' . urlencode($msg));
+}
+$conn->close();
+?>
+File: admin/add_user.php
+
+
+--------------------------------------------------------------------------------
+Edit User Button:
+Code:
+--------------------------------------------------------------------------------
+
+<?php
+session_start();
+if (!isset($_SESSION['Username']) || $_SESSION['Role'] !== 'Admin') {
+    echo json_encode(['success' => false, 'message' => 'Unauthorized access']);
+    exit();
+}
+
+require_once __DIR__ . '/../config/connection.php';
+require_once __DIR__ . '/../lib/log_helper.php';
+
+$userQuery = $conn->prepare("SELECT FullName FROM loginaccount WHERE Username = ?");
+$userQuery->bind_param("s", $_SESSION['Username']);
+$userQuery->execute();
+$userData = $userQuery->get_result()->fetch_assoc();
+$userFullName = $userData['FullName'] ?? 'Administrator';
+
+header('Content-Type: application/json');
+
+if ($_SERVER["REQUEST_METHOD"] == "POST") {
+    $userId = $_POST['userID'];
+    $role = 'Cashier';
+    $fullName = $_POST['fullName'];
+    $username = $_POST['username'];
+    $email = $_POST['email'];
+    $newPassword = isset($_POST['password']) ? trim($_POST['password']) : '';
+    $confirmPassword = isset($_POST['confirmPassword']) ? trim($_POST['confirmPassword']) : '';
+
+    $oldUserStmt = $conn->prepare("SELECT Username, FullName, Email FROM loginaccount WHERE UserID = ?");
+    $oldUserStmt->bind_param("i", $userId);
+    $oldUserStmt->execute();
+    $oldUser = $oldUserStmt->get_result()->fetch_assoc();
+    $oldUserStmt->close();
+
+    if (!$oldUser) {
+        echo json_encode(['success' => false, 'message' => 'User not found.']);
+        exit();
+    }
+
+    $checkStmt = $conn->prepare("SELECT Username FROM loginaccount WHERE Username = ? AND UserID != ?");
+    $checkStmt->bind_param("si", $username, $userId);
+    $checkStmt->execute();
+    $result = $checkStmt->get_result();
+    if ($result->num_rows > 0) {
+        echo json_encode(['success' => false, 'message' => 'Username already exists. Please choose a different username.']);
+        exit();
+    }
+    $checkStmt->close();
+
+    $emailCheckStmt = $conn->prepare("SELECT Email FROM loginaccount WHERE Email = ? AND UserID != ?");
+    $emailCheckStmt->bind_param("si", $email, $userId);
+    $emailCheckStmt->execute();
+    $emailResult = $emailCheckStmt->get_result();
+    if ($emailResult->num_rows > 0) {
+        echo json_encode(['success' => false, 'message' => 'Email already exists. Please use a different email address.']);
+        exit();
+    }
+    $emailCheckStmt->close();
+
+    $updateWithPassword = false;
+    if ($newPassword !== '' || $confirmPassword !== '') {
+        if ($newPassword === '' || $confirmPassword === '') {
+            echo json_encode(['success' => false, 'message' => 'Please enter and confirm the new password.']);
+            exit();
+        }
+        $pattern = '/^(?=.*[A-Z])(?=.*\d)[A-Za-z\d@$!%*?&]{6,}$/';
+        if (!preg_match($pattern, $newPassword)) {
+            echo json_encode(['success' => false, 'message' => 'Password must be at least 6 characters long and contain at least one uppercase letter and one number.']);
+            exit();
+        }
+        if ($newPassword !== $confirmPassword) {
+            echo json_encode(['success' => false, 'message' => 'Passwords do not match. Please re-enter.']);
+            exit();
+        }
+        $hashedPassword = password_hash($newPassword, PASSWORD_DEFAULT);
+        $updateWithPassword = true;
+    }
+
+    if ($updateWithPassword) {
+        $stmt = $conn->prepare("UPDATE loginaccount SET Role = ?, FullName = ?, Username = ?, Email = ?, Password = ? WHERE UserID = ?");
+        $stmt->bind_param("sssssi", $role, $fullName, $username, $email, $hashedPassword, $userId);
+    } else {
+        $stmt = $conn->prepare("UPDATE loginaccount SET Role = ?, FullName = ?, Username = ?, Email = ? WHERE UserID = ?");
+        $stmt->bind_param("ssssi", $role, $fullName, $username, $email, $userId);
+    }
+
+    if ($stmt->execute()) {
+        $changes = [];
+        if ($oldUser['Username'] !== $username) $changes[] = "username updated";
+        if ($oldUser['FullName'] !== $fullName) $changes[] = "full name updated";
+        if ($oldUser['Email'] !== $email) $changes[] = "email updated";
+        if ($updateWithPassword) $changes[] = "password changed";
+
+        if (!empty($changes)) {
+            $description = "User account updated (" . implode(", ", $changes) . "): " . $oldUser['Username'];
+            addSystemLog($conn, "User Updated", $description, $userFullName);
+        }
+
+        echo json_encode(['success' => true, 'message' => 'User updated successfully!']);
+    } else {
+        echo json_encode(['success' => false, 'message' => 'Error updating user: ' . $stmt->error]);
+    }
+    $stmt->close();
+} else {
+    echo json_encode(['success' => false, 'message' => 'Invalid request method']);
+}
+$conn->close();
+?>
+File: admin/edit_user.php
+
+
+--------------------------------------------------------------------------------
+Remove User Button:
+Code:
+--------------------------------------------------------------------------------
+
+<?php
+session_start();
+if (!isset($_SESSION['Username']) || $_SESSION['Role'] !== 'Admin') {
+    echo json_encode(['success' => false, 'message' => 'Unauthorized access']);
+    exit();
+}
+
+require_once __DIR__ . '/../config/connection.php';
+require_once __DIR__ . '/../lib/log_helper.php';
+require_once __DIR__ . '/../lib/recovery_helper.php';
+
+$userQuery = $conn->prepare("SELECT FullName FROM loginaccount WHERE Username = ?");
+$userQuery->bind_param("s", $_SESSION['Username']);
+$userQuery->execute();
+$userData = $userQuery->get_result()->fetch_assoc();
+$userFullName = $userData['FullName'] ?? 'Administrator';
+$userQuery->close();
+
+ensureRecoveryTableExists($conn);
+
+if (isset($_GET['id'])) {
+    $userId = intval($_GET['id']);
+
+    $userDetailsStmt = $conn->prepare("SELECT * FROM loginaccount WHERE UserID = ?");
+    $userDetailsStmt->bind_param("i", $userId);
+    $userDetailsStmt->execute();
+    $userDetails = $userDetailsStmt->get_result()->fetch_assoc();
+    $userDetailsStmt->close();
+
+    if (!$userDetails) {
+        echo json_encode(['success' => false, 'message' => 'User not found.']);
+        exit();
+    }
+
+    storeRecoveryItem($conn, 'user', 'loginaccount', $userDetails['UserID'], $userDetails['Username'], $userDetails, $userFullName);
+
+    $stmt = $conn->prepare("DELETE FROM loginaccount WHERE UserID = ?");
+    $stmt->bind_param("i", $userId);
+
+    if ($stmt->execute()) {
+        addSystemLog($conn, "User Removed", "User account removed: " . $userDetails['Username'], $userFullName);
+        echo json_encode(['success' => true, 'message' => 'Account removed successfully!']);
+    } else {
+        echo json_encode(['success' => false, 'message' => 'Error removing user: ' . $conn->error]);
+    }
+    $stmt->close();
+} else {
+    echo json_encode(['success' => false, 'message' => 'No user ID provided']);
+}
+$conn->close();
+?>
+File: admin/remove_user.php
+
+
+--------------------------------------------------------------------------------
+Logout Button:
+Code:
+--------------------------------------------------------------------------------
+
+<?php
+session_start();
+require_once __DIR__ . '/../config/connection.php';
+require_once __DIR__ . '/../lib/log_helper.php';
+
+$stmt = $conn->prepare("SELECT FullName, Role FROM loginaccount WHERE BINARY Username = ?");
+$stmt->bind_param("s", $_SESSION['Username']);
+$stmt->execute();
+$userData = $stmt->get_result()->fetch_assoc();
+$userFullName = $userData['FullName'];
+$userRole = $userData['Role'];
+
+if (isset($_SESSION['UserID'])) {
+    $removeSession = $conn->prepare("DELETE FROM active_sessions WHERE user_id = ? AND session_id = ?");
+    $removeSession->bind_param("is", $_SESSION['UserID'], session_id());
+    $removeSession->execute();
+    $removeSession->close();
+}
+
+if ($userRole == 'Cashier') {
+    addSystemLog($conn, "POS Logout", "Cashier ended POS session", $userFullName);
+} else {
+    addSystemLog($conn, "Logout", "User logged out", $userFullName);
+}
+
+session_destroy();
+header("Location: ../index.php");
+exit();
+?>
+File: authentication/logout.php
+
+
+--------------------------------------------------------------------------------
+Add Product Button:
+Code:
+--------------------------------------------------------------------------------
+
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['add_product'])) {
+    $inventoryName = $_POST['inventory_name'];
+    $price = $_POST['price'];
+    $categoryId = $_POST['category_id'];
+
+    $checkStmt = $conn->prepare("SELECT COUNT(*) as count FROM inventory WHERE InventoryName = ?");
+    $checkStmt->bind_param("s", $inventoryName);
+    $checkStmt->execute();
+    $result = $checkStmt->get_result();
+    $row = $result->fetch_assoc();
+    $checkStmt->close();
+
+    if ($row['count'] > 0) {
+        $_SESSION['error_message'] = 'A product with this name already exists.';
+    } else {
+        $imagePath = null;
+        if (isset($_FILES['product_image']) && $_FILES['product_image']['error'] == 0) {
+            $targetDir = "../images/";
+            $fileName = time() . '_' . basename($_FILES['product_image']['name']);
+            $targetPath = $targetDir . $fileName;
+
+            $check = getimagesize($_FILES['product_image']['tmp_name']);
+            if ($check !== false) {
+                $allowedTypes = array('jpg', 'jpeg', 'png');
+                $imageFileType = strtolower(pathinfo($targetPath, PATHINFO_EXTENSION));
+
+                if (in_array($imageFileType, $allowedTypes)) {
+                    if (move_uploaded_file($_FILES['product_image']['tmp_name'], $targetPath)) {
+                        $imagePath = $targetPath;
+                    } else {
+                        $_SESSION['error_message'] = 'Sorry, there was an error uploading your file.';
+                    }
+                } else {
+                    $_SESSION['error_message'] = 'Sorry, only JPG, JPEG, PNG & GIF files are allowed.';
+                }
+            } else {
+                $_SESSION['error_message'] = 'File is not an image.';
+            }
+        }
+
+        $stmt = $conn->prepare("INSERT INTO inventory (CategoryID, InventoryName, Price, ImagePath) VALUES (?, ?, ?, ?)");
+        $stmt->bind_param("isds", $categoryId, $inventoryName, $price, $imagePath);
+
+        if ($stmt->execute()) {
+            $catStmt = $conn->prepare("SELECT CategoryName FROM categories WHERE CategoryID = ?");
+            $catStmt->bind_param("i", $categoryId);
+            $catStmt->execute();
+            $categoryData = $catStmt->get_result()->fetch_assoc();
+            $catStmt->close();
+
+            $description = sprintf("New product added: %s (Price: ₱%.2f, Category: %s)", $inventoryName, $price, $categoryData['CategoryName']);
+            addSystemLog($conn, "Product Created", $description, $userFullName);
+
+            $_SESSION['success_message'] = 'Product added successfully!';
+        } else {
+            $_SESSION['error_message'] = 'Error adding product: ' . $stmt->error;
+        }
+        $stmt->close();
+    }
+}
+File: admin/manage_product.php
+
+
+--------------------------------------------------------------------------------
+Edit Product Button:
+Code:
+--------------------------------------------------------------------------------
+
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['edit_product'])) {
+    $id = $_POST['inventory_id'];
+    $inventoryName = $_POST['inventory_name'];
+    $price = $_POST['price'];
+    $categoryId = $_POST['category_id'];
+
+    $stmt = $conn->prepare("SELECT i.InventoryName, i.Price, i.CategoryID, c.CategoryName FROM inventory i JOIN categories c ON i.CategoryID = c.CategoryID WHERE i.InventoryID = ?");
+    $stmt->bind_param("i", $id);
+    $stmt->execute();
+    $oldProduct = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    $imagePath = null;
+    if (isset($_FILES['product_image']) && $_FILES['product_image']['error'] == 0) {
+        $targetDir = "../images/";
+        $fileName = time() . '_' . basename($_FILES['product_image']['name']);
+        $targetPath = $targetDir . $fileName;
+
+        $check = getimagesize($_FILES['product_image']['tmp_name']);
+        if ($check !== false) {
+            $allowedTypes = array('jpg', 'jpeg', 'png');
+            $imageFileType = strtolower(pathinfo($targetPath, PATHINFO_EXTENSION));
+
+            if (in_array($imageFileType, $allowedTypes)) {
+                if (move_uploaded_file($_FILES['product_image']['tmp_name'], $targetPath)) {
+                    $imagePath = $targetPath;
+                } else {
+                    $_SESSION['error_message'] = 'Sorry, there was an error uploading your file.';
+                }
+            } else {
+                $_SESSION['error_message'] = 'Sorry, only JPG, JPEG, PNG & GIF files are allowed.';
+            }
+        } else {
+            $_SESSION['error_message'] = 'File is not an image.';
+        }
+    }
+
+    if ($imagePath === null) {
+        $stmt = $conn->prepare("SELECT ImagePath FROM inventory WHERE InventoryID = ?");
+        $stmt->bind_param("i", $id);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        $row = $result->fetch_assoc();
+        $imagePath = $row['ImagePath'];
+        $stmt->close();
+    }
+
+    $stmt = $conn->prepare("UPDATE inventory SET CategoryID = ?, InventoryName = ?, Price = ?, ImagePath = ? WHERE InventoryID = ?");
+    $stmt->bind_param("isdsi", $categoryId, $inventoryName, $price, $imagePath, $id);
+
+    if ($stmt->execute()) {
+        $catStmt = $conn->prepare("SELECT CategoryName FROM categories WHERE CategoryID = ?");
+        $catStmt->bind_param("i", $categoryId);
+        $catStmt->execute();
+        $newCategory = $catStmt->get_result()->fetch_assoc();
+        $catStmt->close();
+
+        $changes = [];
+        if ($oldProduct['InventoryName'] !== $inventoryName) $changes[] = "name updated from '{$oldProduct['InventoryName']}' to '{$inventoryName}'";
+        if ($oldProduct['Price'] != $price) $changes[] = sprintf("price updated from ₱%.2f to ₱%.2f", $oldProduct['Price'], $price);
+        if ($oldProduct['CategoryID'] != $categoryId) $changes[] = "category updated from '{$oldProduct['CategoryName']}' to '{$newCategory['CategoryName']}'";
+        if ($imagePath !== $row['ImagePath']) $changes[] = "image updated";
+
+        if (!empty($changes)) {
+            $description = sprintf("Product updated (%s): %s", implode(", ", $changes), $oldProduct['InventoryName']);
+            addSystemLog($conn, "Product Updated", $description, $userFullName);
+        }
+
+        $_SESSION['success_message'] = 'Product updated successfully!';
+    } else {
+        $_SESSION['error_message'] = 'Error updating product: ' . $stmt->error;
+    }
+    $stmt->close();
+}
+File: admin/manage_product.php
+
+
+--------------------------------------------------------------------------------
+Remove Product Button:
+Code:
+--------------------------------------------------------------------------------
+
+if (isset($_POST['remove_product'])) {
+    $id = (int)$_POST['inventory_id'];
+
+    $stmt = $conn->prepare("SELECT * FROM inventory WHERE InventoryID = ?");
+    $stmt->bind_param("i", $id);
+    $stmt->execute();
+    $productRow = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    if (!$productRow) {
+        $_SESSION['error_message'] = 'Product not found.';
+    } else {
+        $catStmt = $conn->prepare("SELECT CategoryName FROM categories WHERE CategoryID = ?");
+        $catStmt->bind_param("i", $productRow['CategoryID']);
+        $catStmt->execute();
+        $categoryData = $catStmt->get_result()->fetch_assoc();
+        $catStmt->close();
+
+        storeRecoveryItem($conn, 'product', 'inventory', $productRow['InventoryID'], $productRow['InventoryName'], $productRow, $userFullName);
+
+        $stmt = $conn->prepare("DELETE FROM inventory WHERE InventoryID = ?");
+        $stmt->bind_param("i", $id);
+
+        if ($stmt->execute()) {
+            $description = sprintf("Product removed: %s (Price: ₱%.2f, Category: %s)", $productRow['InventoryName'], $productRow['Price'], $categoryData['CategoryName'] ?? 'N/A');
+            addSystemLog($conn, "Product Removed", $description, $userFullName);
+            $_SESSION['success_message'] = 'Product removed successfully!';
+        } else {
+            $_SESSION['error_message'] = 'Error removing product: ' . $stmt->error;
+        }
+        $stmt->close();
+    }
+}
+File: admin/manage_product.php
+
+
+--------------------------------------------------------------------------------
+Backup Database Button:
+Code:
+--------------------------------------------------------------------------------
+
+<?php
+session_start();
+if (!isset($_SESSION['Username']) || $_SESSION['Role'] !== 'Admin') {
+    header('Location: ../index.php');
+    exit();
+}
+
+require_once __DIR__ . '/../config/connection.php';
+require_once __DIR__ . '/../lib/log_helper.php';
+require_once __DIR__ . '/../lib/backup_helper.php';
+
+$userQuery = $conn->prepare("SELECT FullName FROM loginaccount WHERE Username = ?");
+$userQuery->bind_param("s", $_SESSION['Username']);
+$userQuery->execute();
+$userData = $userQuery->get_result()->fetch_assoc();
+$userFullName = $userData['FullName'] ?? 'Administrator';
+$userQuery->close();
+
+$dbname = "edgies_pos";
+$filename = makeBackupFilename($dbname);
+
+header('Content-Type: application/octet-stream');
+header('Content-Disposition: attachment; filename="' . $filename . '"');
+header('Pragma: no-cache');
+header('Expires: 0');
+
+$output = generateDatabaseBackupSql($conn, $dbname);
+
+addSystemLog($conn, "Database Backup", "Database backup downloaded: {$filename}", $userFullName);
+
+echo $output;
+$conn->close();
+exit();
+?>
+File: admin/backup_database.php
+
+
+--------------------------------------------------------------------------------
+Restore Database Button:
+Code:
+--------------------------------------------------------------------------------
+
+<?php
+session_start();
+if (!isset($_SESSION['Username']) || $_SESSION['Role'] !== 'Admin') {
+    echo json_encode(['success' => false, 'message' => 'Unauthorized access']);
+    exit();
+}
+
+require_once __DIR__ . '/../config/connection.php';
+require_once __DIR__ . '/../lib/log_helper.php';
+
+$userQuery = $conn->prepare("SELECT FullName FROM loginaccount WHERE Username = ?");
+$userQuery->bind_param("s", $_SESSION['Username']);
+$userQuery->execute();
+$userData = $userQuery->get_result()->fetch_assoc();
+$userFullName = $userData['FullName'] ?? 'Administrator';
+$userQuery->close();
+
+header('Content-Type: application/json');
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    echo json_encode(['success' => false, 'message' => 'Invalid request method']);
+    exit();
+}
+
+if (!isset($_FILES['backup_file']) || $_FILES['backup_file']['error'] !== UPLOAD_ERR_OK) {
+    echo json_encode(['success' => false, 'message' => 'No file uploaded or upload error occurred']);
+    exit();
+}
+
+$file = $_FILES['backup_file'];
+$fileName = $file['name'];
+$fileTmpName = $file['tmp_name'];
+$fileSize = $file['size'];
+
+$fileExt = strtolower(pathinfo($fileName, PATHINFO_EXTENSION));
+if ($fileExt !== 'sql') {
+    echo json_encode(['success' => false, 'message' => 'Invalid file type. Please upload a .sql file']);
+    exit();
+}
+
+if ($fileSize > 50 * 1024 * 1024) {
+    echo json_encode(['success' => false, 'message' => 'File size exceeds 50MB limit']);
+    exit();
+}
+
+$sqlContent = file_get_contents($fileTmpName);
+if ($sqlContent === false) {
+    echo json_encode(['success' => false, 'message' => 'Failed to read backup file']);
+    exit();
+}
+
+$conn->query("SET FOREIGN_KEY_CHECKS = 0");
+
+$sqlContent = preg_replace('/--.*$/m', '', $sqlContent);
+$sqlContent = preg_replace('/\/\*.*?\*\//s', '', $sqlContent);
+$queries = array_filter(array_map('trim', explode(';', $sqlContent)));
+
+$successCount = 0;
+$errorCount = 0;
+$errors = [];
+
+foreach ($queries as $query) {
+    $query = trim($query);
+    if (empty($query) || strlen($query) < 10) continue;
+    if (preg_match('/^(SET|COMMIT|START TRANSACTION)/i', $query)) continue;
+
+    if ($conn->query($query)) {
+        $successCount++;
+    } else {
+        $errorCount++;
+        $errors[] = $conn->error;
+    }
+}
+
+$conn->query("SET FOREIGN_KEY_CHECKS = 1");
+
+if ($errorCount > 0 && $successCount === 0) {
+    echo json_encode(['success' => false, 'message' => 'Database restore failed. ' . implode('; ', array_slice($errors, 0, 3))]);
+} else if ($errorCount > 0) {
+    addSystemLog($conn, "Database Restore", "Database restored with {$successCount} successful queries and {$errorCount} errors. File: {$fileName}", $userFullName);
+    echo json_encode(['success' => true, 'message' => "Database restored with {$successCount} successful queries. {$errorCount} queries had errors.", 'warnings' => array_slice($errors, 0, 5)]);
+} else {
+    addSystemLog($conn, "Database Restore", "Database successfully restored from file: {$fileName}", $userFullName);
+    echo json_encode(['success' => true, 'message' => "Database successfully restored from backup file: {$fileName}"]);
+}
+$conn->close();
+?>
+File: admin/restore_database.php
+
+
+--------------------------------------------------------------------------------
+Update Backup Schedule Button:
+Code:
+--------------------------------------------------------------------------------
+
+<?php
+session_start();
+if (!isset($_SESSION['Username']) || $_SESSION['Role'] !== 'Admin') {
+    header('Content-Type: application/json');
+    echo json_encode(['success' => false, 'message' => 'Unauthorized']);
+    exit();
+}
+
+header('Content-Type: application/json');
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    echo json_encode(['success' => false, 'message' => 'Invalid request method']);
+    exit();
+}
+
+$runAt = $_POST['run_at'] ?? '';
+$runAt = trim($runAt);
+
+if ($runAt === '') {
+    echo json_encode(['success' => false, 'message' => 'Please select a date and time']);
+    exit();
+}
+
+if (!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/', $runAt)) {
+    echo json_encode(['success' => false, 'message' => 'Invalid date/time format']);
+    exit();
+}
+
+$dt = DateTime::createFromFormat('Y-m-d\TH:i', $runAt);
+if (!$dt) {
+    echo json_encode(['success' => false, 'message' => 'Invalid date/time']);
+    exit();
+}
+
+$configPath = realpath(__DIR__ . '/..') . DIRECTORY_SEPARATOR . 'config' . DIRECTORY_SEPARATOR . 'backup_schedule.json';
+$payload = ['run_at' => $dt->format('Y-m-d\TH:i')];
+
+$ok = file_put_contents($configPath, json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+if ($ok === false) {
+    echo json_encode(['success' => false, 'message' => 'Failed to save schedule']);
+    exit();
+}
+
+$weekday = strtoupper($dt->format('D'));
+$time = $dt->format('H:i');
+
+echo json_encode(['success' => true, 'message' => 'Automatic backup schedule updated.', 'run_at' => $payload['run_at'], 'task_scheduler' => ['weekday' => $weekday, 'time' => $time]]);
+?>
+File: admin/update_backup_schedule.php
+
+
+--------------------------------------------------------------------------------
+Add Category Button:
+Code:
+--------------------------------------------------------------------------------
+
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['add_category'])) {
+    $categoryName = $_POST['category_name'];
+
+    $checkStmt = $conn->prepare("SELECT COUNT(*) as count FROM categories WHERE CategoryName = ?");
+    $checkStmt->bind_param("s", $categoryName);
+    $checkStmt->execute();
+    $result = $checkStmt->get_result();
+    $row = $result->fetch_assoc();
+    $checkStmt->close();
+
+    if ($row['count'] > 0) {
+        $message = "A category with this name already exists!";
+        $messageType = "error";
+    } else {
+        $stmt = $conn->prepare("INSERT INTO categories (CategoryName, date_created) VALUES (?, NOW())");
+        $stmt->bind_param("s", $categoryName);
+
+        if ($stmt->execute()) {
+            addSystemLog($conn, "Category Created", "New category created: " . $categoryName, $userFullName);
+            $message = "Category added successfully!";
+            $messageType = "success";
+        } else {
+            $message = "Error: " . $stmt->error;
+            $messageType = "error";
+        }
+        $stmt->close();
+    }
+}
+File: admin/category.php
+
+
+--------------------------------------------------------------------------------
+Edit Category Button:
+Code:
+--------------------------------------------------------------------------------
+
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['edit_category'])) {
+    $categoryId = $_POST['category_id'];
+    $categoryName = $_POST['category_name'];
+
+    $stmt = $conn->prepare("SELECT CategoryName FROM categories WHERE CategoryID = ?");
+    $stmt->bind_param("i", $categoryId);
+    $stmt->execute();
+    $oldCategory = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    $stmt = $conn->prepare("UPDATE categories SET CategoryName = ? WHERE CategoryID = ?");
+    $stmt->bind_param("si", $categoryName, $categoryId);
+
+    if ($stmt->execute()) {
+        addSystemLog($conn, "Category Updated", "Category name updated from '" . $oldCategory['CategoryName'] . "' to '" . $categoryName . "'", $userFullName);
+        $message = "Category updated successfully!";
+        $messageType = "success";
+    } else {
+        $message = "Error: " . $stmt->error;
+        $messageType = "error";
+    }
+    $stmt->close();
+}
+File: admin/category.php
+
+
+--------------------------------------------------------------------------------
+Remove Category Button:
+Code:
+--------------------------------------------------------------------------------
+
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['remove_category'])) {
+    $categoryId = (int)$_POST['category_id'];
+
+    $stmt = $conn->prepare("SELECT * FROM categories WHERE CategoryID = ?");
+    $stmt->bind_param("i", $categoryId);
+    $stmt->execute();
+    $categoryData = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    if (!$categoryData) {
+        $message = "Category not found.";
+        $messageType = "error";
+    } else {
+        storeRecoveryItem($conn, 'category', 'categories', $categoryData['CategoryID'], $categoryData['CategoryName'], $categoryData, $userFullName);
+
+        $stmt = $conn->prepare("DELETE FROM categories WHERE CategoryID = ?");
+        $stmt->bind_param("i", $categoryId);
+
+        if ($stmt->execute()) {
+            addSystemLog($conn, "Category Removed", "Category removed: " . $categoryData['CategoryName'], $userFullName);
+            $message = "Category removed successfully!";
+            $messageType = "success";
+        } else {
+            $message = "Error: " . $stmt->error;
+            $messageType = "error";
+        }
+        $stmt->close();
+    }
+}
+File: admin/category.php
+
+
+--------------------------------------------------------------------------------
+Update Profile Button (Account Settings):
+Code:
+--------------------------------------------------------------------------------
+
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['update_profile'])) {
+    $fullName = trim($_POST['fullName']);
+    $username = trim($_POST['username']);
+    $email = trim($_POST['email']);
+
+    if (empty($fullName) || empty($username) || empty($email)) {
+        $message = 'All fields are required.';
+        $messageType = 'error';
+    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $message = 'Invalid email address.';
+        $messageType = 'error';
+    } else {
+        $checkStmt = $conn->prepare("SELECT UserID FROM loginaccount WHERE Username = ? AND UserID != ?");
+        $checkStmt->bind_param("si", $username, $userId);
+        $checkStmt->execute();
+        $checkResult = $checkStmt->get_result();
+        $checkStmt->close();
+
+        if ($checkResult->num_rows > 0) {
+            $message = 'Username already exists. Please choose a different username.';
+            $messageType = 'error';
+        } else {
+            $emailCheckStmt = $conn->prepare("SELECT UserID FROM loginaccount WHERE Email = ? AND UserID != ?");
+            $emailCheckStmt->bind_param("si", $email, $userId);
+            $emailCheckStmt->execute();
+            $emailResult = $emailCheckStmt->get_result();
+            $emailCheckStmt->close();
+
+            if ($emailResult->num_rows > 0) {
+                $message = 'Email already exists. Please use a different email address.';
+                $messageType = 'error';
+            } else {
+                $updateStmt = $conn->prepare("UPDATE loginaccount SET FullName = ?, Username = ?, Email = ? WHERE UserID = ?");
+                $updateStmt->bind_param("sssi", $fullName, $username, $email, $userId);
+
+                if ($updateStmt->execute()) {
+                    if ($username !== $_SESSION['Username']) {
+                        $_SESSION['Username'] = $username;
+                    }
+                    $description = "Admin profile updated: " . $username;
+                    addSystemLog($conn, "Profile Updated", $description, $userFullName);
+                    $message = 'Profile updated successfully!';
+                    $messageType = 'success';
+                } else {
+                    $message = 'Error updating profile: ' . $updateStmt->error;
+                    $messageType = 'error';
+                }
+                $updateStmt->close();
+            }
+        }
+    }
+}
+File: admin/account_settings.php
+
+
+--------------------------------------------------------------------------------
+Change Password Button (Account Settings):
+Code:
+--------------------------------------------------------------------------------
+
+if (isset($_POST['change_password'])) {
+    $currentPassword = $_POST['currentPassword'];
+    $newPassword = trim($_POST['newPassword']);
+    $confirmPassword = trim($_POST['confirmPassword']);
+
+    if (empty($currentPassword) || empty($newPassword) || empty($confirmPassword)) {
+        $message = 'All password fields are required.';
+        $messageType = 'error';
+    } elseif ($newPassword !== $confirmPassword) {
+        $message = 'New passwords do not match.';
+        $messageType = 'error';
+    } else {
+        $verifyStmt = $conn->prepare("SELECT Password FROM loginaccount WHERE UserID = ?");
+        $verifyStmt->bind_param("i", $userId);
+        $verifyStmt->execute();
+        $verifyResult = $verifyStmt->get_result();
+        $verifyData = $verifyResult->fetch_assoc();
+        $verifyStmt->close();
+
+        if (!password_verify($currentPassword, $verifyData['Password'])) {
+            $message = 'Current password is incorrect.';
+            $messageType = 'error';
+        } else {
+            $passwordPattern = '/^(?=.*[A-Z])(?=.*\d)[A-Za-z\d@$!%*?&]{6,}$/';
+            if (!preg_match($passwordPattern, $newPassword)) {
+                $message = 'Password must be at least 6 characters long and contain at least one uppercase letter and one number.';
+                $messageType = 'error';
+            } else {
+                $hashedPassword = password_hash($newPassword, PASSWORD_DEFAULT);
+                $updateStmt = $conn->prepare("UPDATE loginaccount SET Password = ? WHERE UserID = ?");
+                $updateStmt->bind_param("si", $hashedPassword, $userId);
+
+                if ($updateStmt->execute()) {
+                    $description = "Admin password changed: " . $currentUsername;
+                    addSystemLog($conn, "Password Changed", $description, $userFullName);
+                    $message = 'Password changed successfully!';
+                    $messageType = 'success';
+                } else {
+                    $message = 'Error changing password: ' . $updateStmt->error;
+                    $messageType = 'error';
+                }
+                $updateStmt->close();
+            }
+        }
+    }
+}
+File: admin/account_settings.php
+
+
+--------------------------------------------------------------------------------
+Generate Report Button (Sales Report CSV):
+Code:
+--------------------------------------------------------------------------------
+
+<?php
+session_start();
+if (!isset($_SESSION['Username']) || $_SESSION['Role'] !== 'Admin') {
+    header('Location: ../index.php');
+    exit();
+}
+
+require_once __DIR__ . '/../config/connection.php';
+require_once __DIR__ . '/../lib/log_helper.php';
+
+$userQuery = $conn->prepare("SELECT FullName FROM loginaccount WHERE Username = ?");
+$userQuery->bind_param("s", $_SESSION['Username']);
+$userQuery->execute();
+$userData = $userQuery->get_result()->fetch_assoc();
+$userFullName = $userData['FullName'];
+
+$startDateParam = isset($_GET['start_date']) ? $_GET['start_date'] : date('Y-m-01');
+$endDateParam = isset($_GET['end_date']) ? $_GET['end_date'] : date('Y-m-t');
+$entries = isset($_GET['entries']) ? $_GET['entries'] : '10';
+$entries = ($entries === 'all') ? PHP_INT_MAX : (int)$entries;
+$search = isset($_GET['search']) ? trim($_GET['search']) : '';
+
+$startDate = date('Y-m-d 00:00:00', strtotime($startDateParam));
+$endDate = date('Y-m-d 23:59:59', strtotime($endDateParam));
+$startDateForDisplay = date('Y-m-d', strtotime($startDateParam));
+$endDateForDisplay = date('Y-m-d', strtotime($endDateParam));
+
+// ... build transactions query, execute, then:
+header('Content-Type: text/csv; charset=utf-8');
+header('Content-Disposition: attachment; filename="sales_report_' . $startDateForDisplay . '_to_' . $endDateForDisplay . '.csv"');
+header('Pragma: no-cache');
+header('Expires: 0');
+
+$output = fopen('php://output', 'w');
+fprintf($output, chr(0xEF).chr(0xBB).chr(0xBF));
+fputcsv($output, array("EDGIE'S RESTAURANT AND EVENT PLACE"));
+fputcsv($output, array('SALES REPORT'));
+fputcsv($output, array('Period', date('F d, Y', strtotime($startDateForDisplay)) . ' to ' . date('F d, Y', strtotime($endDateForDisplay))));
+fputcsv($output, array('Generated', date('F d, Y h:i A')));
+fputcsv($output, array('Generated By', $userFullName));
+// ... write transaction rows, summary ...
+fclose($output);
+
+$description = sprintf("Generated sales report for period %s to %s", $startDateForDisplay, $endDateForDisplay);
+addSystemLog($conn, "Report Generated", $description, $userFullName);
+
+$conn->close();
+?>
+File: admin/generate_report.php
+
+
+--------------------------------------------------------------------------------
+Delete Log Button (Log History):
+Code:
+--------------------------------------------------------------------------------
+
+<?php
+session_start();
+if (!isset($_SESSION['Username']) || $_SESSION['Role'] !== 'Admin') {
+    echo json_encode(['success' => false, 'message' => 'Unauthorized']);
+    exit();
+}
+
+require_once __DIR__ . '/../config/connection.php';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['log_id'])) {
+    $logId = (int)$_POST['log_id'];
+
+    $stmt = $conn->prepare("DELETE FROM system_logs WHERE log_id = ?");
+    $stmt->bind_param("i", $logId);
+
+    if ($stmt->execute()) {
+        echo json_encode(['success' => true]);
+    } else {
+        echo json_encode(['success' => false, 'message' => 'Failed to delete log']);
+    }
+} else {
+    echo json_encode(['success' => false, 'message' => 'Invalid request']);
+}
+?>
+File: admin/delete_log.php
+
+
+--------------------------------------------------------------------------------
+Receipt Reprint Button (Transaction History):
+Code:
+--------------------------------------------------------------------------------
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['log_reprint'])) {
+    $transactionNum = $_POST['transaction_num'];
+    $description = sprintf(
+        "Receipt reprinted for Transaction #%s",
+        $transactionNum
+    );
+    addSystemLog($conn, "Receipt Reprint", $description, $userFullName);
+    $conn->close();
+    exit();
+}
+File: admin/transaction_history.php
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================
